@@ -1,0 +1,1317 @@
+---
+title: "Project"
+author: "Prarthna Khemka"
+date: "2022-11-10"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+```
+
+## Packages
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggfortify)
+library(astsa)
+library(lubridate)
+library(corrplot)
+library(forecast)
+#library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(reshape2)
+library(caret)
+library(pls)
+# library(xgboost)
+# library("readxl")
+# library("car")
+# library("vars")
+# library("MTS")
+```
+
+## Dataset
+
+```{r}
+#Read in individual years
+df1 <- read.csv("aqidaily2012.csv")
+df2 <- read.csv("aqidaily2013.csv")
+df3 <- read.csv("aqidaily2014.csv")
+df4 <- read.csv("aqidaily2015.csv")
+df5 <- read.csv("aqidaily2016.csv")
+df6 <- read.csv("aqidaily2017.csv")
+df7 <- read.csv("aqidaily2018.csv")
+df8 <- read.csv("aqidaily2019.csv")
+df9 <- read.csv("aqidaily2020.csv")
+df10 <- read.csv("aqidaily2021.csv")
+
+#Combine to one df
+aqiDaily <- rbind(df1, df2, df3, df4, df5, df6, df7, df8, df9, df10)
+
+```
+
+## Data Cleaning
+
+### Restructuring
+
+```{r}
+#Convert to date
+aqiDaily$Date <- as.Date(aqiDaily$Date, "%m/%d/%Y")
+
+#Convert character vars to respective types
+chr2fct <- aqiDaily %>% select(-c(CO, Ozone, PM10, PM25, NO2)) %>% mutate_if(is.character, as.factor)
+chr2num <- aqiDaily %>% select(c(CO, Ozone, PM10, PM25, NO2)) %>% mutate_if(is.character, as.numeric)
+
+
+#Combine into a new restructured df
+aqiDaily_new <- cbind(chr2fct, chr2num)
+
+summary(aqiDaily_new)
+
+#####Remove SiteId since its exactly the same as name and remove source of overall aqi
+
+aqiDaily_new <- aqiDaily_new %>% select(-c(Site.ID..of.Overall.AQI., Source..of.Overall.AQI.))
+```
+
+### Imputing
+
+```{r}
+#Check na vals
+percNA <- colSums(is.na.data.frame(aqiDaily_new))/dim(aqiDaily_new)[1] * 100
+percNA
+
+# We remove PM10 as per standard val > 30% Missing vals
+aqi_clean <- aqiDaily_new %>% select(-PM10)
+aqi_clean <- aqi_clean %>% mutate_if(is.numeric, function(x) ifelse(is.na(x),
+median(x, na.rm = T), x))
+```
+
+## Exploratory Data Analysis
+
+```{r}
+
+summary(aqi_clean)
+
+colnames(aqi_clean)[2] <- "AQI"
+
+##Initial Plots to see distribution with time
+plot(ts(aqi_clean$AQI, start = c(2012, 1), frequency = 365), main = "AQI vs time", ylab = "AQI")
+
+plot(ts(aqi_clean$Ozone, start = c(2012, 1), frequency = 365), main = "Ozone concentration vs time", ylab = "Ozone")
+
+plot(ts(aqi_clean$PM25, start = c(2012, 1), frequency = 365), main = "PM2.5 concentration vs time", ylab = "PM2.5")
+
+plot(ts(aqi_clean$CO, start = c(2012, 1), frequency = 365), main = "CO concentration vs time", ylab = "CO")
+
+plot(ts(aqi_clean$NO2, start = c(2012, 1), frequency = 365), main = "NO2 concentration vs time", ylab = "NO2")
+
+##Checking AQI and pollutants by site
+aqi_clean %>% group_by(Site.Name..of.Overall.AQI.) %>% 
+  summarise(
+    AvgAQI = mean(AQI),
+    AvgCO = mean(CO),
+    AvgOzone = mean(Ozone),
+    AvgPM2.5 = mean(PM25),
+    AvgNO2 = mean(NO2)
+  )
+
+##Main Pollutant plot
+ggplot(aqi_clean, aes(x = Main.Pollutant, fill = Main.Pollutant)) + geom_histogram(stat = "count") + ggtitle("Main Pollutants in the air")
+
+#Decompose AQI to see trends
+aqiTS <- ts(aqi_clean$AQI, start = c(2012, 1), frequency = 365)
+aqiSTL <- stl(aqiTS, s.window = "periodic")
+autoplot(aqiSTL, ts.colour = "slategray")
+
+#Correlation between pollutants
+corr <- cor(aqi_clean[, c(2, 5, 6, 7, 8)])
+corrplot::corrplot(corr)
+```
+
+## Univariate AQI Analysis
+
+#### Split Data
+
+```{r}
+test_size <- round(0.2 * length(aqiTS))
+test <- ts(tail(aqiTS, n = test_size), start = c(2020, 1), frequency = 365)
+train <- ts(head(aqiTS, n = length(aqiTS) - test_size), start = c(2012, 1), frequency = 365)
+```
+
+#### Differencing
+
+```{r}
+#Plot ACF and PACF
+acf(train)
+pacf(train) #possible AR1
+
+#Check if differencing needed
+diffTrain <- diff(train)
+plot(diffTrain)
+acf(diffTrain) #possible MA2
+pacf(diffTrain)
+
+#Redifference
+plot(diff(diffTrain))
+acf(diff(diffTrain)) #possible MA1
+pacf(diff(diffTrain)) 
+
+#Seasonal analysis
+s <- stl(train, s.window = "periodic")$time.series[, 1]
+acf(diff(diff(s))) #possible MA1
+pacf(diff(diff(s)))
+```
+
+#### Model Diagnostics
+
+```{r}
+mod1 <- sarima(train, 1, 0, 0) #def not it
+mod2 <- sarima(train, 0, 1, 2) #Def not it
+mod3 <- sarima(train, 0, 2, 1) #Def not it
+mod4 <- sarima(train, 1, 0, 1) #def not it
+mod5 <- sarima(train, 1, 1, 2) #not it
+mod6 <- sarima(train, 3, 1, 1) #meh fit
+mod7 <- sarima(train, 3, 0, 0) #meh fit
+mod8 <- sarima(train, 4, 0, 0) #meh fit
+mod9 <- sarima(train, 2, 1, 1) #not great fit
+
+```
+
+## Aggregated data analysis
+
+#### Aggregate weekly mean AQI
+
+```{r}
+#Aggregate daily into weekly
+aqiWeekly <- aqi_clean
+aqiWeekly$Week <- lubridate::floor_date(aqiWeekly$Date, "week")
+aqiWeekly <- aqiWeekly %>% group_by(Week) %>% summarise(avgAQI = mean(AQI))
+aqiWeeklyTS <- ts(aqiWeekly$avgAQI, start = c(2012, 1), frequency = 52)
+aqiWeeklySTL <- stl(aqiWeeklyTS, s.window = 52)
+autoplot(aqiWeeklySTL, ts.colour = "slategray")
+```
+
+```{r}
+#Split data
+test_size <- round(0.2 * length(aqiWeeklyTS))
+test1 <- ts(tail(aqiWeeklyTS, n = test_size), start = c(2020, 1), frequency = 52)
+train1 <- ts(head(aqiWeeklyTS, n = length(aqiWeeklyTS) - test_size), start = c(2012, 1), frequency = 52)
+
+#Plot ACF and PACF
+plot(train1)
+acf(train1)
+pacf(train1) #possible AR1
+
+#Check if differencing needed
+diffTrain1 <- diff(train1)
+plot(diffTrain1)
+acf(diffTrain1) #possible MA1
+pacf(diffTrain1)
+
+#Models
+mod1 <- sarima(train1, 1, 0, 0) #Great fit
+mod2 <- sarima(train1, 0, 1, 1) #Def not it
+mod3 <- sarima(train1, 1, 1, 1) #Def not it
+mod4 <- sarima(train1, 2, 0, 0) #Great fit
+
+#Plot of weekly superimposed over daily
+plot(aqiTS, col = "darkgray", main = "AQI vs Time")
+lines(aqiWeeklyTS, col = "red")
+legend("topleft", legend = c("Daily", "Weekly"), fill = c("darkgray", "red"))
+```
+
+#### Using Auto.arima for optimal models
+
+```{r}
+
+bestMod1 <- auto.arima(train) 
+summary(bestMod1) #ARIMA(5,0,3) non-zero mean
+
+bestMod2 <- auto.arima(train, d = 1) 
+summary(bestMod2) #ARIMA(2,1,1) 
+
+bestMod3 <- auto.arima(train1) 
+summary(bestMod3) #ARIMA(2,0,0) non-zero mean
+
+bestMod4 <- auto.arima(train1, d = 1) 
+summary(bestMod4) #ARIMA(0,1,1) with drift
+
+```
+
+## Model Selection
+
+#### Predictions
+
+```{r}
+pred1 <- forecast(bestMod1, h = 731)
+pred2 <- forecast(bestMod2, h = 731)
+
+pred3 <- forecast(bestMod3, h = 104)
+pred4 <- forecast(bestMod4, h = 104)
+
+pred5 <- sarima.for(train1, n.ahead = 104, 1, 0, 0)
+pred6 <- sarima.for(train1, n.ahead = 104, 1, 1, 1)
+pred7 <- sarima.for(train1, n.ahead = 104, 0, 1, 1)
+pred8 <- sarima.for(train1, n.ahead = 104, 2, 0, 0)
+```
+
+#### Evaluation Metrics
+
+```{r}
+accuracy(pred1$mean, test1)
+accuracy(pred2$mean, test1)
+accuracy(pred3$mean, test1)
+accuracy(pred4$mean, test1)
+accuracy(pred5$pred, test1)
+accuracy(pred6$pred, test1)
+accuracy(pred7$pred, test1)
+accuracy(pred8$pred, test1)
+
+```
+
+Weekly undifferenced is the best according to all metrics. Daily models are not being considered due to extreme variations.
+
+## Weekly multipollutant Analysis
+
+#### Aggregate daily data for each pollutant
+
+```{r}
+# plot weekly data 
+aqi_clean_weekly <- aqi_clean %>% 
+  mutate(week = lubridate::floor_date(Date, unit="week")) %>% 
+  group_by( week ) %>% 
+  summarize ( aqi = mean(AQI), 
+              co = mean(CO), 
+              ozone = mean(Ozone), 
+              pm25 = mean(PM25), 
+              no2 = mean(NO2)) %>% 
+  ungroup
+
+```
+
+```{r}
+aqi_weekly_ts <- ts(aqi_clean_weekly$aqi, start = c(2012, 1,1), frequency = 52)
+plot.ts(aqi_weekly_ts)
+
+adf.test(aqi_weekly_ts)
+
+lag.length = 25
+Box.test(aqi_weekly_ts, lag=lag.length, type="Ljung-Box") 
+```
+
+#### Seasonal Decomposition
+
+```{r}
+aqi_stl <- stl(ts(aqi_ts, start = c(2012, 1), frequency = 365), "per")
+ozone_stl <- stl(ts(ozone_ts, start = c(2012, 1), frequency = 365), "per")
+pm25_stl <- stl(ts(pm25_ts, start = c(2012, 1), frequency = 365), "per")
+co_stl <- stl(ts(co_ts, start = c(2012, 1), frequency = 365), "per")
+no2_stl <- stl(ts(no2_ts, start = c(2012, 1), frequency = 365), "per")
+
+plot(aqi_stl, main="AQI Seasonal Trend Decomposition")
+plot(ozone_stl, main="Ozone Seasonal Trend Decomposition")
+plot(pm25_stl, main="PM2.5 Seasonal Trend Decomposition")
+plot(co_stl, main="CO Seasonal Trend Decomposition")
+plot(no2_stl, main="NO2 Seasonal Trend Decomposition")
+```
+
+-   strong seasonal trends in AQI and pollutants
+-   local peaks and valleys in general trends
+-   for some pollutants, max levels occur in 2021
+-   only no2 shows decreasing trends in 2022
+
+```{r}
+plot(aqi_stl$time.series[,2], col="black", ylim=c(0,60), main="Pollutant Trends Overlaid on AQI")
+lines(ozone_stl$time.series[,2], col="blue")
+lines(co_stl$time.series[,2], col="red")
+lines(pm25_stl$time.series[,2], col="yellow")
+lines(no2_stl$time.series[,2], col="green")
+```
+
+-   PM25 seems to have really similar trend with AQI
+
+```{r}
+plot(aqi_stl$time.series[,1], col="black", ylim=c(-20,40), main="Pollutant Seasonal Trends Overlaid on AQI")
+lines(ozone_stl$time.series[,1], col="blue")
+lines(co_stl$time.series[,1], col="red")
+lines(pm25_stl$time.series[,1], col="yellow")
+lines(no2_stl$time.series[,1], col="green")
+```
+
+-   seasonality trends of NO2, CO and PM25 have seasonal trends that are coincident with each other, while ozone tends to have slightly lagged(?) seasonal trends
+
+#### ACF, PACF, Differencing
+
+```{r}
+# Sample ACF/PACF of raw data
+par(mfrow=c(1,2))
+acf(aqi_ts)
+pacf(aqi_ts)
+
+par(mfrow=c(1,2))
+acf(co_ts)
+pacf(co_ts)
+
+par(mfrow=c(1,2))
+acf(no2_ts)
+pacf(no2_ts)
+
+par(mfrow=c(1,2))
+acf(ozone_ts)
+pacf(ozone_ts)
+
+par(mfrow=c(1,2))
+acf(pm25_ts)
+pacf(pm25_ts)
+```
+
+```{r}
+# Sample ACF/PACF of first differenced data
+par(mfrow=c(1,2))
+acf(diff(aqi_ts))
+pacf(diff(aqi_ts))
+
+par(mfrow=c(1,2))
+acf(diff(co_ts))
+pacf(diff(co_ts))
+
+par(mfrow=c(1,2))
+acf(diff(no2_ts))
+pacf(diff(no2_ts))
+
+par(mfrow=c(1,2))
+acf(diff(ozone_ts))
+pacf(diff(ozone_ts))
+
+par(mfrow=c(1,2))
+acf(diff(pm25_ts))
+pacf(diff(pm25_ts))
+```
+
+```{r}
+# Create seasonal dummies for daily 
+aqi_clean <- aqi_clean %>% mutate(day = as.factor(format(as.Date(Date), "%m.%d")))
+
+#model.matrix(~ aqi_clean$day -1) 
+library(fastDummies)
+aqi_seas <- aqi_clean %>% dummy_cols(select_columns='day', remove_first_dummy=TRUE)
+```
+
+```{r}
+rnames <- c()
+cnames <- c("aqi", "co", "no2", "ozone", "pm25")
+
+ts_matrix <- matrix(cbind(aqi_ts, co_ts, no2_ts, ozone_ts, pm25_ts), nrow=3653, ncol=5, dimnames=list(rnames, cnames)) 
+
+corr_mx <- cor(ts_matrix)
+corr_mx 
+
+library(corrplot)
+corrplot(corr_mx, type="upper", order="hclust")
+```
+
+## Univariate Analyses on Different Pollutants
+
+```{r}
+# Split train and test 
+aqi_ts_train <- ts(aqi_ts[1:2922], start=c(2012,1,1), freq=365)
+co_ts_train <- ts(co_ts[1:2922], start=c(2012,1,1), frequency=365)
+no2_ts_train <- ts(no2_ts[1:2922], start=c(2012,1,1), frequency=365)
+ozone_ts_train <- ts(ozone_ts[1:2922], start=c(2012,1,1), frequency=365)
+pm25_ts_train <- ts(pm25_ts[1:2922], start=c(2012,1,1), frequency=365)
+
+aqi_ts_test <- ts(aqi_ts[2923:3653], start=c(2020,1,1), frequency=365)
+co_ts_test <- ts(co_ts[2923:3653], start=c(2020,1,1),  frequency=365)
+no2_ts_test <- ts(no2_ts[2923:3653], start=c(2020,1,1),  frequency=365)
+ozone_ts_test <- ts(ozone_ts[2923:3653], start=c(2020,1,1), frequency=365)
+pm25_ts_test <- ts(pm25_ts[2923:3653], start=c(2020,1,1), frequency=365)
+```
+
+```{r}
+aqi_fit <- auto.arima(aqi_ts_train)
+summary(aqi_fit) # ARIMA(5,0,3) with non-zero mean 
+
+co_fit <- auto.arima(co_ts_train)
+summary(co_fit) # ARIMA(5,1,3) 
+
+no2_fit <- auto.arima(no2_ts_train)
+summary(no2_fit) # ARIMA(2,0,2) with non-zero mean 
+
+ozone_fit <- auto.arima(ozone_ts_train)
+summary(ozone_fit) # ARIMA(5,0,1) with non-zero mean 
+
+pm25_fit <- auto.arima(pm25_ts_train)
+summary(pm25_fit)  #ARIMA(5,0,3) with non-zero mean
+
+```
+
+```{r}
+# Try enforcing seasonality -> same results
+aqi_fit <- auto.arima(aqi_ts_train, seasonal=TRUE)
+summary(aqi_fit) # ARIMA(5,0,3) with non-zero mean 
+
+co_fit <- auto.arima(co_ts_train, seasonal=TRUE)
+summary(co_fit)  # ARIMA(5,1,3) 
+
+no2_fit <- auto.arima(no2_ts_train, seasonal=TRUE)
+summary(no2_fit)  # ARIMA(2,0,2) with non-zero mean 
+
+ozone_fit <- auto.arima(ozone_ts_train, seasonal=TRUE)
+summary(ozone_fit) # ARIMA(5,0,1) with non-zero mean 
+
+pm25_fit <- auto.arima(pm25_ts_train, seasonal=TRUE)
+summary(pm25_fit)  #ARIMA(5,0,3) with non-zero mean
+```
+
+```{r}
+co_sarima_fore <- sarima.for(co_ts_train, 731, 5, 0, 2)
+no2_sarima_fore <- sarima.for(no2_ts_train, 731, 5, 1, 3)
+ozone_sarima_fore <- sarima.for(ozone_ts_train, 731, 2, 0, 2)
+pm25_sarima_fore <- sarima.for(pm25_ts_train, 731, 1,0,2)
+```
+
+## ARIMA diagnostics
+
+```{r}
+co_sarima = sarima(co_ts_train, 5,0,2)
+no2_sarima = sarima(no2_ts_train, 5,1,3)
+ozone_sarima = sarima(ozone_ts_train, 2,0,2)
+pm25_sarima = sarima(pm25_ts_train, 1,0,2)
+
+```
+
+Overall bad fits bc seasonality is not taken into account
+
+## TBATS (Trigonometric Seasonality, Box-Cox Transformation, ARMA errors, Trend, Seasonal Components)
+
+```{r}
+co_tbats <- tbats(co_ts_train)
+co_tbats
+
+predict(co_tbats, 104)
+co_tbats_fore <- forecast(co_tbats, 731)
+plot(co_tbats_fore)
+```
+
+```{r}
+no2_tbats <- tbats(no2_ts_train)
+no2_tbats
+
+predict(no2_tbats, 104)
+no2_tbats_fore <- forecast(no2_tbats, 731)
+plot(no2_tbats_fore)
+```
+
+```{r}
+ozone_tbats <- tbats(ozone_ts_train)
+ozone_tbats
+
+predict(ozone_tbats, 731)
+ozone_tbats_fore <- forecast(ozone_tbats, 731)
+plot(ozone_tbats_fore)
+```
+
+```{r}
+pm25_tbats <- tbats(pm25_ts_train)
+pm25_tbats
+
+predict(pm25_tbats, 731)
+pm25_tbats_fore <- forecast(pm25_tbats, 731)
+plot(pm25_tbats_fore)
+```
+
+## Exponential Smoothing State-Space Model-\> Holts-Winter Filter
+
+```{r}
+co_ets <- ets(co_ts_train)
+summary(co_ets)
+autoplot(co_ets)
+
+co_ets_fore <- forecast(co_ets, h=731)
+plot(co_ets_fore)
+```
+
+```{r}
+no2_ets <- ets(no2_ts_train)
+summary(no2_ets)
+autoplot(no2_ets)
+
+no2_ets_fore <- forecast(no2_ets, h=731)
+plot(no2_ets_fore)
+```
+
+```{r}
+ozone_ets <- ets(ozone_ts_train)
+summary(ozone_ets)
+autoplot(ozone_ets)
+
+ozone_ets_fore <- forecast(ozone_ets, h=731)
+plot(ozone_ets_fore)
+```
+
+```{r}
+pm25_ets <- ets(pm25_ts_train)
+summary(pm25_ets)
+autoplot(pm25_ets)
+
+pm25_ets_fore <- forecast(pm25_ets, h=731)
+plot(pm25_ets_fore)
+```
+
+```{r}
+library("expsmooth")
+co_hw <- HoltWinters(co_ts_train)
+summary(co_hw)
+
+plot(co_ts_train, col="gray")
+lines(co_hw$fitted[,1], lty=2, col="blue")
+
+co_hw_fore <- forecast(co_hw, h=731)
+plot(co_hw_fore)
+
+acf(co_hw_fore$residuals, lag.max=20, na.action=na.pass)
+Box.test(co_hw_fore$residuals, lag=20, type="Ljung-Box")
+hist(co_hw_fore$residuals)
+
+```
+
+```{r}
+no2_hw <- HoltWinters(no2_ts_train)
+summary(no2_hw)
+
+plot(no2_ts_train, col="gray")
+lines(no2_hw$fitted[,1], lty=2, col="blue")
+
+no2_hw_fore <- forecast(no2_hw, h=731)
+plot(no2_hw_fore, xlim=c(2018, 2022.15))
+
+acf(no2_hw_fore$residuals, lag.max=20, na.action=na.pass)
+Box.test(no2_hw_fore$residuals, lag=20, type="Ljung-Box")
+hist(no2_hw_fore$residuals)
+```
+
+```{r}
+ozone_hw <- HoltWinters(ozone_ts_train)
+summary(no2_hw)
+
+plot(ozone_ts_train, col="gray")
+lines(ozone_hw$fitted[,1], lty=2, col="blue")
+
+ozone_hw_fore <- forecast(ozone_hw, h=731)
+plot(ozone_hw_fore, xlim=c(2018, 2022.15))
+#lines(no2_hw$fitted)
+
+acf(ozone_hw_fore$residuals, lag.max=20, na.action=na.pass)
+Box.test(ozone_hw_fore$residuals, lag=20, type="Ljung-Box")
+hist(ozone_hw_fore$residuals)
+```
+
+```{r}
+pm25_hw <- HoltWinters(pm25_ts_train)
+summary(pm25_hw)
+
+plot(pm25_ts_train, col="gray")
+lines(pm25_hw$fitted[,1], lty=2, col="blue")
+
+pm25_hw_fore <- forecast(pm25_hw, h=731)
+plot(pm25_hw_fore, xlim=c(2018, 2022.15))
+#lines(no2_hw$fitted)
+
+acf(pm25_hw_fore$residuals, lag.max=20, na.action=na.pass)
+Box.test(pm25_hw_fore$residuals, lag=20, type="Ljung-Box")
+hist(pm25_hw_fore$residuals)
+```
+
+## ARCH/GARCH
+
+-   Check heteroskedaticity of residuals with Engle's ARCH Test Ho: Residuals exhibits no ARCH effects. H1: ARCH(lag) effects are present.
+
+```{r}
+archTest(co_sarima$fit$residuals)
+archTest(no2_sarima$fit$residuals)
+archTest(ozone_sarima$fit$residuals)
+archTest(pm25_sarima$fit$residuals)
+```
+
+-   Firstly, check if residual plot displays any cluster of volatility. Next, observe the squared residual plot. If there are clusters of volatility, ARCH/GARCH should be used to model the volatility of the series to reflect more recent changes and fluctuations in the series. Finally, ACF & PACF of squared residuals will help confirm if the residuals (noise term) are not independent and can be predicted.
+
+```{r}
+par(mfrow=c(2,2))
+plot(co_sarima$fit$residuals)
+plot(co_sarima$fit$residuals^2)
+acf(co_sarima$fit$residuals^2)
+pacf(co_sarima$fit$residuals^2)
+
+par(mfrow=c(2,2))
+plot(no2_sarima$fit$residuals)
+plot(no2_sarima$fit$residuals^2)
+acf(no2_sarima$fit$residuals^2)
+pacf(no2_sarima$fit$residuals^2)
+
+par(mfrow=c(2,2))
+plot(ozone_sarima$fit$residuals)
+plot(ozone_sarima$fit$residuals^2)
+acf(ozone_sarima$fit$residuals^2)
+pacf(ozone_sarima$fit$residuals^2)
+
+par(mfrow=c(2,2))
+plot(pm25_sarima$fit$residuals)
+plot(pm25_sarima$fit$residuals^2)
+acf(pm25_sarima$fit$residuals^2)
+pacf(pm25_sarima$fit$residuals^2)
+```
+
+```{r}
+par(mfrow=c(2,2))
+plot(resid(co_hw))
+plot(resid(co_hw)^2)
+acf(resid(co_hw)^2)
+pacf(resid(co_hw)^2)
+
+par(mfrow=c(2,2))
+plot(resid(no2_hw))
+plot(resid(no2_hw)^2)
+acf(resid(no2_hw)^2)
+pacf(resid(no2_hw)^2)
+
+par(mfrow=c(2,2))
+plot(resid(ozone_hw))
+plot(resid(ozone_hw)^2)
+acf(resid(ozone_hw)^2)
+pacf(resid(ozone_hw)^2)
+
+par(mfrow=c(2,2))
+plot(resid(pm25_hw))
+plot(resid(pm25_hw)^2)
+acf(resid(pm25_hw)^2)
+pacf(resid(pm25_hw)^2)
+```
+
+```{r}
+co_garch <- garchFit(co_ts_train ~ garch(1,1), data=co_ts_train)
+summary(co_garch)
+
+par(mfrow=c(1,2))
+acf(residuals(co_garch, standardize=T))
+pacf(residuals(co_garch, standardize=T))
+
+co_garch_fore <- predict(co_garch, 731)
+```
+
+```{r}
+no2_garch <- garchFit(no2_ts_train ~ garch(1,1), data=no2_ts_train)
+summary(no2_garch)
+
+par(mfrow=c(1,2))
+acf(residuals(no2_garch, standardize=T))
+pacf(residuals(no2_garch, standardize=T))
+
+no2_garch_fore <- predict(no2_garch, 731)
+```
+
+```{r}
+ozone_garch <- garchFit(ozone_ts_train ~ garch(1,1), data=ozone_ts_train)
+summary(ozone_garch)
+
+par(mfrow=c(1,2))
+acf(residuals(ozone_garch, standardize=T))
+pacf(residuals(ozone_garch, standardize=T))
+
+ozone_garch_fore <- predict(ozone_garch, 731)
+```
+
+```{r}
+pm25_garch <- garchFit(pm25_ts_train ~ garch(1,1), data=pm25_ts_train)
+summary(pm25_garch)
+
+par(mfrow=c(1,2))
+acf(residuals(pm25_garch, standardize=T))
+pacf(residuals(pm25_garch, standardize=T))
+
+pm25_garch_fore <- predict(pm25_garch, 731)
+```
+
+# OLD - Multivariate Analyses
+
+## ARIMA
+
+```{r}
+rnames <- c()
+cnames <- c("aqi", "co", "no2", "ozone", "pm25")
+seas_cols <- as.matrix(aqi_seas[,10:374])
+
+ts_matrix <- matrix(cbind(aqi_ts, co_ts, no2_ts, ozone_ts, pm25_ts), nrow=3653, ncol=5, dimnames=list(rnames, cnames)) # FIX COL DIMENSIONS
+
+auto.arima(ts_matrix[,1]) # D=1 enforces seasonality 
+arima(aqi_seas$Overall.AQI.Value, order=c(1,1,1), xreg=as.matrix(aqi_seas[,10:374])) 
+```
+
+## SARIMA
+
+```{r}
+sarima_ <- sarima()
+```
+
+## VAR
+
+```{r}
+# Selection 
+print(VARselect(ts_matrix, lag.max=30, type="const")[["selection"]])
+print(VARselect(ts_matrix, lag.max=30, type="trend")[["selection"]])
+print(VARselect(ts_matrix, lag.max=30, type="both")[["selection"]])
+```
+
+```{r}
+# Estimation 
+var7 <- VAR(ts_matrix, p=7, type="const")
+summary(var7)
+serial.test(var7, lags.pt=10, type="PT.asymptotic")
+
+var16 <- VAR(ts_matrix, p=16, type="const")
+summary(var16)
+serial.test(var16, lags.pt=10, type="PT.asymptotic")
+
+acf(resid(var7, 30))
+acf(resid(var16, 30))
+```
+
+```{r}
+# Forecast 
+(fit.pr = predict(var7, n.ahead = 24, ci = 0.95)) # 4 weeks ahead 
+fanchart(fit.pr) 
+```
+
+## VARMA
+
+```{r}
+Eccm(ts_matrix, maxp=20, maxq=20)
+
+varma_ <- VARMA(ts_matrix, p=10, q=10)
+```
+
+## sVARMA
+
+```{r}
+svarma_ <- sVARMA(ts_matrix, order=c(1,1,1), sorder=c(1,1,1), s=)
+```
+
+# Evaluation
+
+# Evaluation
+
+## Individual Pollutants Time Series
+
+```{r}
+# Compute MSE, RMSE, MAE, MAPE on test set 
+
+cat("CO time series \n SARIMA: \n")
+accuracy(co_sarima_fore$pred, co_ts_test)
+cat("\n Holt-Winters:\n")
+accuracy(co_hw_fore$mean, co_ts_test)
+cat("\n TBATS:\n")
+accuracy(co_tbats_fore$mean, co_ts_test)
+cat("\n ETS:\n")
+accuracy(co_ets_fore$mean, co_ts_test)
+cat("\n GARCH:\n")
+accuracy(co_garch_fore$meanForecast, co_ts_test)
+
+
+cat("NO2 time series \n SARIMA: \n")
+accuracy(no2_sarima_fore$pred, no2_ts_test)
+cat("\n Holt-Winters:\n")
+accuracy(no2_hw_fore$mean, no2_ts_test)
+cat("\n TBATS:\n")
+accuracy(no2_tbats_fore$mean, no2_ts_test)
+cat("\n ETS:\n")
+accuracy(no2_ets_fore$mean, no2_ts_test)
+cat("\n GARCH:\n")
+accuracy(no2_garch_fore$meanForecast, no2_ts_test)
+
+
+cat("Ozone time series \n SARIMA: \n")
+accuracy(ozone_sarima_fore$pred, ozone_ts_test)
+cat("\n Holt-Winters:\n")
+accuracy(ozone_hw_fore$mean, ozone_ts_test)
+cat("\n TBATS:\n")
+accuracy(ozone_tbats_fore$mean, ozone_ts_test)
+cat("\n ETS:\n")
+accuracy(ozone_ets_fore$mean, ozone_ts_test)
+cat("\n GARCH:\n")
+accuracy(ozone_garch_fore$meanForecast, ozone_ts_test)
+
+
+cat("PM25 time series \n SARIMA: \n")
+accuracy(pm25_sarima_fore$pred, pm25_ts_test)
+cat("\n Holt-Winters:\n")
+accuracy(pm25_hw_fore$mean, pm25_ts_test)
+cat("\n TBATS:\n")
+accuracy(pm25_tbats_fore$mean, pm25_ts_test)
+cat("\n ETS:\n")
+accuracy(pm25_ets_fore$mean, pm25_ts_test)
+cat("\n GARCH:\n")
+accuracy(pm25_garch_fore$meanForecast, pm25_ts_test)
+
+```
+
+-   Best models:
+    -   CO: GARCH/SARIMA
+    -   NO2: Holt-Winters
+    -   Ozone: TBATS
+    -   PM25: TBATS
+
+CO GARCH ME RMSE MAE MPE MAPE ACF1 Theil's U Test set 1.408099 3.575544 2.459537 3.774506 28.27525 0.7766806 1.443224 NO2 Holt-Winters ME RMSE MAE MPE MAPE ACF1 Theil's U Test set -0.8710966 8.732807 6.531409 -18.00688 38.75622 0.6585719 1.201239 Ozone TBATS ME RMSE MAE MPE MAPE ACF1 Theil's U Test set 0.3199899 14.8203 8.841122 -7.990665 23.20444 0.6083302 0.7819436 PM25 TBATS ME RMSE MAE MPE MAPE ACF1 Theil's U Test set 4.917036 24.30759 16.30118 -11.46199 40.4741 0.7919492 1.435104
+
+## Predict AQI with Max Pollutant Predictions
+
+```{r}
+aqi_max_predict <- pmax(co_sarima_fore$pred, no2_hw_fore$mean, ozone_hw_fore$mean, pm25_tbats_fore$mean)
+accuracy(aqi_max_predict, aqi_ts_test)
+```
+
+RMSE, MAE, MAPE are higher than weekly predictions
+
+-   Sliding Window Evaluation
+
+```{r}
+# Cross-Validate Prediction Error Rate 
+cv.ts <- function(data_ts,
+                  sarima,
+                  holtwinters, 
+                  tbats, 
+                  n_train = 418){
+  
+    cv.error <- tibble(rmse = c(), mse=c(), mae=c(), mape=c() )
+    
+   # Do time cross validation
+   while(n_train < length(data_ts)){
+     
+    # Create train and test folds
+    train_fold <- ts(data_ts[1:n_train], freq=52)
+    test_fold <- ts(data_ts[n_train+1], freq=52)
+    
+    # SARIMA 
+    # refit model with chosen parameters 
+    
+    
+    # forecast next time step 
+    sarima.predictions <- predict(lm.fit, test_fold %>% dplyr::select(-response), type = "response")
+
+    # compute error 
+    sarima.error_list <- accuracy(sarima.predictions, test_fold) 
+    sarima.cv.error <- cv.error %>% 
+          rbind( tibble( rmse = accuracy[2], mse = accuracy[2]^2, mae = accuracy[3], mape=accuracy[5]))
+    
+    # HOLT-WINTERS 
+    # TBATS 
+ 
+    # Increment n_train
+    n_train = n_train + 1
+   }
+    
+    cv.summary <- cv.error %>% summarize_all( mean ) 
+    
+   return(cv.summary)
+}
+```
+
+## Machine Learning Approach
+
+### Split Data
+
+```{r}
+#Split data
+test_size <- round(0.2 * dim(aqi_clean_weekly)[1])
+test <- tail(aqi_clean_weekly, n = test_size)
+train <- head(aqi_clean_weekly, n = dim(aqi_clean_weekly)[1] - test_size)
+```
+
+### Data Preprocessing
+
+```{r}
+train_params <- preProcess(train[, 2:6])
+train1 <- data.matrix(predict(train_params, train[, 2:6]))
+test1 <-  data.matrix(predict(train_params, test[, 2:6]))
+
+# weekTr <- rep(1:52, 8)
+# train1 <- cbind(train1, weekTr)
+# 
+# weekTe <- rep(1:52, 2)
+# test1 <- cbind(test1, weekTe)
+
+# train1 <- data.matrix(train[, 2:6])
+# test1 <- data.matrix(test[, 2:6])
+
+timesteps <- 3
+
+ncols <- ncol(train1)
+train_len <- dim(train1)[1] - timesteps
+test_len <- dim(test1)[1] - timesteps
+
+x_train <- matrix(0, nrow = train_len, ncol = timesteps * ncols)
+y_train <- matrix(0, nrow = train_len, ncol = 1)
+x_test <- matrix(0, nrow = test_len, ncol = timesteps * ncols)
+y_test <- matrix(0, nrow = test_len, ncol = 1)
+
+for(i in 1:train_len){
+  lags <- melt(train1[i:(i + timesteps-1),])
+  x_train[i,] <- lags$value
+  y_train[i] <- train1[i + timesteps, 1]
+  
+  # if(i == 1){
+  #   lags1 <- lags$value
+  # }
+  # 
+  # if(i == 2){
+  #   a <- c(lags1, lags$value)
+  # }
+}
+
+for(i in 1:test_len){
+  lags <- melt(test1[i:(i + timesteps-1),])
+  x_test[i,] <- lags$value
+  y_test[i] <- test1[i + timesteps, 1]
+}
+
+aqi_mean <- train_params$mean[1]
+aqi_sd <- train_params$std[1]
+
+```
+
+### Lasso Regression
+
+```{r}
+set.seed(1)
+lasso_mod <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10, 
+                       lambda = 10^seq(6, -6, length = 100))
+
+df <- data.frame(lambda = lasso_mod$lambda, cv_mse = lasso_mod$cvm,
+                 nzero_coef = lasso_mod$nzero)
+
+#Plot of cv mse as function of lambda
+ggplot(data = df, aes(x = lambda, y = cv_mse, col = nzero_coef)) + geom_point() +
+  scale_x_continuous(trans = 'log10') +
+  scale_y_continuous(trans = 'log10')
+
+#Get best lam
+optLam <- lasso_mod$lambda.min
+
+#Fit lasso through best lam to get predictions
+lasso_mod_best <- glmnet(x_train, y_train, alpha = 1)
+(lasso_coef <- predict(lasso_mod_best, s = optLam, type = "coefficients"))
+lasso_pred <- predict(lasso_mod_best, s = optLam, newx = x_test)
+
+#Reverse the scaling
+lasso_pred <- lasso_pred * aqi_sd + aqi_mean
+y_test1 <- y_test * aqi_sd + aqi_mean
+
+accuracy(as.vector(lasso_pred), y_test1)
+
+# lasso_rmse <- sqrt(mean((lasso_pred - y_test)^2))
+# cat("Lasso RMSE:", lasso_rmse)
+```
+
+As can be seen, ML already does a better job at predicting AQI levels than time-series.
+
+### Random Forest
+
+```{r}
+set.seed(1)
+#Random Forest
+testRMSE <- c()
+predicted <- c()
+
+
+x_train1 <- as.data.frame(x_train)
+nms <- paste(lags$Var2, c("t-3", "t-2", "t-1"), sep = "_")
+colnames(x_train1) <- nms
+
+
+len <- timesteps * ncols
+mtry  <- seq(1, len, 1)
+
+for(i in 1:len){
+  rf <- randomForest(x = x_train, y = y_train, xtest = x_test, 
+                   ytest = y_test, mtry = mtry[i], ntree = 500)
+  testRMSE[[i]] <- sqrt(rf$test$mse)
+  predicted[[i]] <- rf$test$predicted
+  
+}
+
+rf_dat <- data.frame(ntree = rep(1:500, len), 
+                     mtry = rep(unlist(mtry), each = 500), 
+                     testRMSE = unlist(testRMSE))
+
+ggplot(rf_dat, aes(ntree, testRMSE, col = factor(mtry))) + geom_line() 
+
+opt <- rf_dat[which.min(rf_dat$testRMSE),]
+opt
+rf_pred <- predicted[[opt[,2]]]
+
+
+
+# set.seed(1)
+rf1 <- randomForest(x = x_train1, y = y_train, mtry =  opt[, 2], ntree = opt[, 1])
+rf_pred <- predict(rf1, newdata = x_test)
+# # 
+#Reverse the scaling
+rf_pred <- rf_pred * aqi_sd + aqi_mean
+y_test1 <- y_test * aqi_sd + aqi_mean
+
+
+accuracy(rf_pred, y_test1)
+
+
+
+varImpPlot(rf1)
+```
+
+### Ridge Regression
+
+```{r}
+set.seed(1)
+ridge_mod <- cv.glmnet(x_train, y_train, alpha = 0, nfolds = 10, 
+                       lambda = 10^seq(6, -6, length = 100))
+
+df <- data.frame(lambda = ridge_mod$lambda, cv_mse = ridge_mod$cvm)
+
+#Plot of cv mse as function of lambda
+ggplot(data = df, aes(x = lambda, y = cv_mse)) + geom_point() +
+  scale_x_continuous(trans = 'log10') +
+  scale_y_continuous(trans = 'log10')
+
+#Get best lam
+optLam <- ridge_mod$lambda.min
+
+#Fit lasso through best lam to get predictions
+ridge_mod_best <- glmnet(x = x_train, y = y_train, alpha = 0)
+ridge_coef <- predict(ridge_mod_best, s = optLam, type = "coefficients")
+ridge_pred <- predict(ridge_mod_best, s = optLam, newx = x_test)
+
+#Reverse the scaling
+ridge_pred <- ridge_pred * aqi_sd + aqi_mean
+y_test1 <- y_test * aqi_sd + aqi_mean
+
+accuracy(as.vector(ridge_pred), y_test1)
+```
+
+### PCR
+
+```{r}
+set.seed(1)
+library(pls)
+
+#PCR through cross validation
+pcr_mod <- pcr(y_train ~ x_train, scale = F, center = F, validation = "CV")
+
+# pcr_mod <- pcr(train1[,1] ~ train1[, 2:5], scale = F, center = F, validation = "CV")
+pcr_mse <- data.frame(M = MSEP(pcr_mod, estimate = "CV")$comps, 
+                         MSE = (MSEP(pcr_mod, estimate = "CV")$val %>% melt())$value) 
+pcr_mse$Min_MSE <- as.numeric(min(pcr_mse$MSE) == pcr_mse$MSE)
+
+#Plot of test error as function of M
+ggplot(data = pcr_mse, aes(x = M, y = MSE)) + 
+  geom_point(aes(col = factor(Min_MSE))) + geom_line(col = "slategray") + 
+  labs(title = "Test error vs M")
+
+#Predicting using best M
+M <- pcr_mse[which.max(pcr_mse$Min_MSE),1]
+pcr_pred <- predict(pcr_mod, newdata = x_test, ncomp = M)
+
+#Reverse the scaling
+pcr_pred <- pcr_pred * aqi_sd + aqi_mean
+y_test1 <- y_test * aqi_sd + aqi_mean
+
+accuracy(as.vector(pcr_pred), as.vector(y_test1))
+
+a <- data.frame(date = test[4:104, 1], y_test = y_test[,1], y_pred = pcr_pred)
+colnames(a) <- c("week","y_test", "pcr_pred")
+
+# plot(test[4:104,1], y_test[,1], type = "l", col = "red")
+# lines(test[4:104,1],pcr_pred, type = "l", col = "blue")
+# plot(a$y_test, col = "red", type = "l") 
+# lines(b$pcr_pred, col = "blue")
+
+
+ggplot(a, aes(week)) + 
+  geom_line(aes(y = y_test1, color = "y_test")) +
+  geom_line(aes(y = pcr_pred, color = "pcr_pred")) + 
+  ylab("AQI values") + 
+  xlab("Weeks") + 
+  ggtitle("PCR AQI predictions vs Actual AQI")
+  
+x_train1 <- as.data.frame(x_train)
+nms <- paste(lags$Var2, c("t-3", "t-2", "t-1"), sep = "_")
+colnames(x_train1) <- nms
+
+
+pr.out <- prcomp(x_train1, center = F, scale. = F)
+autoplot(pr.out) + geom_point()
+
+biplot(pr.out)
+```
+
+![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACgAAAAaCAYAAADFTB7LAAAAcElEQVR4Xu3OwQmAQAxE0bClWYCW5N06tM6V2YPg5CjoF/JhLoHAi6iqn9eOefUbqrYvHY0cQDLyAlKRNyARmYA0ZMLRkAlGQyaU72tkAtlim7r/vJqDUDjlKBROOQyFU2icQuMUGqfQuBEaV1XPOwEx96nYACK8+wAAAABJRU5ErkJggg== "Run Current Chunk")
+
+### PLS
+
+```{r}
+
+set.seed(1)
+
+#PLS through cross validation
+pls_mod <- plsr(y_train ~ x_train, scale = F, center = F, validation = "CV")
+pls_mse <- data.frame(M = MSEP(pls_mod, estimate = "CV")$comps, 
+                         MSE = (MSEP(pls_mod, estimate = "CV")$val %>% melt())$value) 
+pls_mse$Min_MSE <- as.numeric(min(pls_mse$MSE) == pls_mse$MSE)
+
+#Plot of test error as function of M
+ggplot(data = pls_mse, aes(x = M, y = MSE)) + 
+  geom_point(aes(col = factor(Min_MSE))) + geom_line(col = "slategray")
+
+#Predicting using best M
+M <- pls_mse[which.max(pls_mse$Min_MSE),1]
+pls_pred <- predict(pls_mod, newdata = x_test, ncomp = M)
+
+#Reverse the scaling
+pls_pred <- pls_pred * aqi_sd + aqi_mean
+y_test1 <- y_test * aqi_sd + aqi_mean
+
+accuracy(as.vector(pls_pred), as.vector(y_test1))
+
+
+```
+
+### Boosting
+
+```{r}
+set.seed(1)
+
+# colnames(x_train) <- paste0("X", seq(1:len))
+# y_train <- as.double(y_train[,1])
+# 
+# xgb_trcontrol <- trainControl(
+#   method = "cv", 
+#   number = 10,
+#   allowParallel = TRUE, 
+#   verboseIter = FALSE, 
+#   returnData = FALSE
+# )
+# 
+# xgb_grid <- expand.grid(
+#   list(
+#     nrounds = seq(100,200),
+#     max_depth = c(10,15,20), 
+#     colsample_bytree = 1, 
+#     eta = 0.1,
+#     gamma = 0,
+#     min_child_weight = 1,  
+#     subsample = 1)
+# )
+# 
+# xgb <- train(x_train, y_train, trControl = xgb_trcontrol, tuneGrid = xgb_grid, 
+#              method = "xgbTree", nthread = 1)
+# 
+# xgb$bestTune
+# 
+# xgb_pred <- predict(xgb, newdata = x_test)
+# 
+# #Reverse the scaling
+# xgb_pred <- xgb_pred * aqi_sd + aqi_mean
+# y_test1 <- y_test * aqi_sd + aqi_mean
+# 
+# accuracy(xgb_pred, y_test1)
+x_train1 <- as.data.frame(x_train)
+
+len <- timesteps * ncols
+nms <- paste(lags$Var2, c("t-5", "t-4", "t-3", "t-2", "t-1"), sep = "_")
+colnames(x_train1) <- nms
+
+x_train1 <- cbind(x_train1, y_train)
+
+x_test1 <- as.data.frame(x_test)
+colnames(x_test1) <- nms
+
+#Init vars
+lam <- 10^seq(-5, 0, 0.1)
+teACC <- c()
+
+a <- c()
+
+#Loop throguh lambda grid
+# for(j in 1:len){
+
+  for(i in 1:length(lam)){
+    boost <- gbm(y_train ~., data = x_train1, distribution = "gaussian", n.trees = 100,
+                        interaction.depth = 2, shrinkage = lam[i])
+    #predict for train and test
+    boost_pred <- predict(boost, newdata = x_test1, n.trees = 100)
+    
+    #Reverse the scaling
+    boost_pred <- boost_pred * aqi_sd + aqi_mean
+    y_test1 <- y_test * aqi_sd + aqi_mean
+    
+    
+    #Mse for train and test
+    teACC[[i]] <- accuracy(boost_pred, y_test1)
+  }
+
+
+  # #Data frame for plotting
+  teACC1 <- data.frame(matrix(unlist(teACC), ncol = 5, byrow = T))
+  colnames(teACC1) <- c("ME", "RMSE", "MAE", "MPE", "MAPE")
+
+  boost_datTe  <- cbind(lam, teACC1)
+  ggplot(boost_datTe, aes(lam, RMSE)) + geom_point(col = "gray") +
+  geom_line(col = "#0d5ddf") +
+  scale_x_continuous(trans = "log10", limits = c(10^-5, 1)) +
+  labs(title = "RMSE vs lambda values") + theme_bw()
+
+# 
+# #Boosting
+# boost_mse <- min(boost_datTe$test.error)
+# cat("\nBoosting RMSE:", sqrt(boost_mse))
+
+  optMetrics <- boost_datTe[which.min(boost_datTe$RMSE), ]
+
+  #Best Lambda and the corresponding boosting model for it
+  optLam <- optMetrics[,1]
+  a <- rbind(a, optMetrics)
+  
+  boost.best <- gbm(y_train ~., data = x_train1, distribution = "gaussian", n.trees = 100,
+                      interaction.depth = 2, shrinkage = 0.07943282)
+
+  
+# }
+
+a <- cbind(a, 1:len)
+
+a
+#Creates var imp plot and gives df for the weights of importance
+summary(boost.best)
+```
+
+## Get df
+
+```{r}
+df_valid <- read.csv("aqidaily2022.csv")
+df_oct <- df_valid[274:304,]
+
+#Convert to date
+df_oct$Date <- as.Date(df_oct$Date, "%m/%d/%Y")
+
+#Convert character vars to respective types
+# chr2fct <- df_oct %>% select(-c(CO, Ozone, PM10, PM25, NO2)) %>% mutate_if(is.character, as.factor)
+# chr2num <- df_oct %>% select(c(CO, Ozone, PM10, PM25, NO2)) %>% mutate_if(is.character, as.numeric)
+# 
+# 
+# #Combine into a new restructured df
+# oct_new <- cbind(chr2fct, chr2num)
+# 
+# summary(oct_new)
+# 
+# #####Remove SiteId since its exactly the same as name and remove source of overall aqi
+# 
+# oct_new <- oct_new %>% select(-c(Site.ID..of.Overall.AQI., Source..of.Overall.AQI.))
+```
